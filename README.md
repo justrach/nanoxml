@@ -13,7 +13,7 @@ Parity is **test-first and SDK-refereed**: [src/parity_test.zig](src/parity_test
 One-liner (detects platform, installs from the latest release):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justrach/nanoxml/main/install.sh | sh
+curl -fsSL https://justrach.github.io/nanoxml/install.sh | sh
 ```
 
 Or grab a prebuilt binary from the [releases page](https://github.com/justrach/nanoxml/releases) (macOS binaries are Developer-ID signed):

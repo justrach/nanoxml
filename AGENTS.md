@@ -5,7 +5,7 @@
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justrach/nanoxml/main/install.sh | sh
+curl -fsSL https://justrach.github.io/nanoxml/install.sh | sh
 ```
 
 or grab a binary directly from [releases](https://github.com/justrach/nanoxml/releases) (`nanoxml-darwin-arm64`, `nanoxml-darwin-x86_64`, `nanoxml-linux-x86_64`, `nanoxml-linux-arm64`).

@@ -64,9 +64,9 @@ echo "== github release $TAG =="
 git tag -f "$TAG"
 git push -f origin "$TAG"
 if gh release view "$TAG" >/dev/null 2>&1; then
-    gh release upload "$TAG" "$DIST"/nanoxml-* "$DIST"/checksums.sha256 --clobber
+    gh release upload "$TAG" "$DIST"/nanoxml-* "$DIST"/checksums.sha256 install.sh --clobber
 else
-    gh release create "$TAG" "$DIST"/nanoxml-* "$DIST"/checksums.sha256 \
+    gh release create "$TAG" "$DIST"/nanoxml-* "$DIST"/checksums.sha256 install.sh \
         --title "nanoxml $TAG" --notes-file tools/release_notes.md
 fi
 echo "DONE: https://github.com/justrach/nanoxml/releases/tag/$TAG"
