@@ -38,6 +38,8 @@ fn usage() void {
         \\  nanoxml sheets <file>             list worksheets (xlsx)
         \\  nanoxml csv    <file> [sheet#]    worksheet as CSV (xlsx)
         \\  nanoxml dump   <file> <part>      raw bytes of one part
+        \\  nanoxml validate <file>           OpenXmlValidator-style diagnostics
+        \\  nanoxml roundtrip <file> <out>    re-serialize main part via DOM, save
         \\  nanoxml bench  <file> [iters] [full|parse|unzip]
         \\  nanoxml new    docx|xlsx|pptx <out-file>   create a document
         \\
@@ -100,6 +102,14 @@ fn mainImpl(argv: []const [*:0]const u8) !void {
             return;
         }
         try cmdDump(arena, data, std.mem.span(argv[3]), w);
+    } else if (std.mem.eql(u8, cmd, "validate")) {
+        try cmdValidate(arena, data, w);
+    } else if (std.mem.eql(u8, cmd, "roundtrip")) {
+        if (argv.len < 4) {
+            usage();
+            return;
+        }
+        try cmdRoundtrip(arena, io, data, std.mem.span(argv[3]));
     } else if (std.mem.eql(u8, cmd, "bench")) {
         const iters: usize = if (argv.len > 3)
             try std.fmt.parseInt(usize, std.mem.span(argv[3]), 10)
@@ -437,4 +447,55 @@ fn cmdNew(gpa: std.mem.Allocator, io: std.Io, kind: []const u8, out_path: []cons
     try file_writer.end();
 
     std.debug.print("wrote {s} ({d} bytes)\n", .{ out_path, bytes.len });
+}
+
+// ── validate: OpenXmlValidator-style diagnostics ────────────────────────────
+
+fn cmdValidate(gpa: std.mem.Allocator, data: []const u8, w: *std.Io.Writer) !void {
+    var pkg = try opc.Package.open(gpa, data);
+    defer pkg.deinit();
+    var result = try nanoxml.validate.validatePackage(gpa, &pkg);
+    defer result.deinit();
+
+    for (result.diagnostics) |d| {
+        try w.print("[{s}] {s}: {s}\n", .{
+            @tagName(d.severity),
+            d.part orelse "(package)",
+            d.message,
+        });
+    }
+    try w.print("{d} error(s), {d} diagnostic(s)\n", .{
+        result.errorCount(),
+        result.diagnostics.len,
+    });
+    // Diagnostics flush on unwind; the error makes the exit code nonzero.
+    if (!result.ok()) return error.ValidationFailed;
+}
+
+// ── roundtrip: open → DOM-reserialize main part → save ─────────────────────
+
+fn cmdRoundtrip(gpa: std.mem.Allocator, io: std.Io, data: []const u8, out_path: []const u8) !void {
+    var pkg = try opc.Package.open(gpa, data);
+    defer pkg.deinit();
+    const arena = pkg.arena.allocator();
+
+    const main_part = (try pkg.partByRelType(null, opc.RelType.office_document)) orelse
+        return error.PartNotFound;
+    const root = try nanoxml.dom.parse(arena, try pkg.getPart(main_part));
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(gpa);
+    try nanoxml.dom.serialize(root, gpa, &ser, .{});
+    try pkg.setPart(main_part, ser.items);
+
+    const out = try pkg.save(gpa);
+    defer gpa.free(out);
+
+    var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer file.close(io);
+    var fw_buf: [64 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &fw_buf);
+    try file_writer.interface.writeAll(out);
+    try file_writer.end();
+
+    std.debug.print("roundtripped -> {s} ({d} bytes; {s} re-serialized through dom)\n", .{ out_path, out.len, main_part });
 }

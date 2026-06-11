@@ -1126,39 +1126,124 @@ pub const PresentationBuilder = struct {
         try self.slides.append(a, copy);
     }
 
+    /// Emits the full minimal-valid deck skeleton: slide master, slide
+    /// layout, theme, sldSz/notesSz, and per-slide shape trees. Microsoft's
+    /// own OpenXmlValidator passes the output with zero errors (its own
+    /// `PresentationDocument.Create` minimal output does not — it omits the
+    /// master and notesSz).
     pub fn save(self: *PresentationBuilder, gpa: std.mem.Allocator) ![]u8 {
         const a = self.arena.allocator();
+
+        const ct_master = "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
+        const ct_layout = "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+        const ct_theme = "application/vnd.openxmlformats-officedocument.theme+xml";
+
+        const sp_tree_header =
+            "<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>";
 
         var files: std.ArrayList(zip.TestFile) = .empty;
         var ct: std.ArrayList(u8) = .empty;
         try appendFmt(&ct, a, "{s}<Types xmlns=\"{s}\">" ++
             "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" ++
             "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" ++
-            "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"{s}\"/>", .{ xml_decl, ct_xmlns, ct_pptx_main });
+            "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"{s}\"/>" ++
+            "<Override PartName=\"/ppt/slideMasters/slideMaster1.xml\" ContentType=\"{s}\"/>" ++
+            "<Override PartName=\"/ppt/slideLayouts/slideLayout1.xml\" ContentType=\"{s}\"/>" ++
+            "<Override PartName=\"/ppt/theme/theme1.xml\" ContentType=\"{s}\"/>", .{ xml_decl, ct_xmlns, ct_pptx_main, ct_master, ct_layout, ct_theme });
 
         var pres: std.ArrayList(u8) = .empty;
-        try appendFmt(&pres, a, "{s}<p:presentation xmlns:p=\"{s}\" xmlns:r=\"{s}\"><p:sldIdLst>", .{ xml_decl, p_ns, opc.rel_ns });
+        const master_rid = self.slides.items.len + 1;
+        try appendFmt(&pres, a, "{s}<p:presentation xmlns:p=\"{s}\" xmlns:r=\"{s}\">" ++
+            "<p:sldMasterIdLst><p:sldMasterId id=\"2147483648\" r:id=\"rId{d}\"/></p:sldMasterIdLst><p:sldIdLst>", .{ xml_decl, p_ns, opc.rel_ns, master_rid });
         var pres_rels: std.ArrayList(u8) = .empty;
         try appendFmt(&pres_rels, a, "{s}<Relationships xmlns=\"{s}\">", .{ xml_decl, pkg_rels_xmlns });
 
         for (self.slides.items, 0..) |lines, i| {
             var sx: std.ArrayList(u8) = .empty;
-            try appendFmt(&sx, a, "{s}<p:sld xmlns:p=\"{s}\" xmlns:a=\"{s}\"><p:cSld><p:spTree>", .{ xml_decl, p_ns, a_ns });
-            for (lines) |line| {
+            try appendFmt(&sx, a, "{s}<p:sld xmlns:p=\"{s}\" xmlns:a=\"{s}\"><p:cSld><p:spTree>{s}" ++
+                "<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Content\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/>" ++
+                "<p:txBody><a:bodyPr/><a:lstStyle/>", .{ xml_decl, p_ns, a_ns, sp_tree_header });
+            if (lines.len == 0) {
+                try sx.appendSlice(a, "<a:p/>");
+            } else for (lines) |line| {
                 try sx.appendSlice(a, "<a:p><a:r><a:t>");
                 try xml.escapeAppend(&sx, a, line, .text);
                 try sx.appendSlice(a, "</a:t></a:r></a:p>");
             }
-            try sx.appendSlice(a, "</p:spTree></p:cSld></p:sld>");
+            try sx.appendSlice(a, "</p:txBody></p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>");
 
             const part_name = try std.fmt.allocPrint(a, "ppt/slides/slide{d}.xml", .{i + 1});
             try files.append(a, .{ .name = part_name, .data = sx.items });
+
+            var slide_rels: std.ArrayList(u8) = .empty;
+            try appendFmt(&slide_rels, a, "{s}<Relationships xmlns=\"{s}\">" ++
+                "<Relationship Id=\"rId1\" Type=\"{s}/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\"/>" ++
+                "</Relationships>", .{ xml_decl, pkg_rels_xmlns, opc.rel_ns });
+            try files.append(a, .{
+                .name = try std.fmt.allocPrint(a, "ppt/slides/_rels/slide{d}.xml.rels", .{i + 1}),
+                .data = slide_rels.items,
+            });
+
             try appendFmt(&ct, a, "<Override PartName=\"/{s}\" ContentType=\"{s}\"/>", .{ part_name, ct_pptx_slide });
             try appendFmt(&pres, a, "<p:sldId id=\"{d}\" r:id=\"rId{d}\"/>", .{ 256 + i, i + 1 });
             try appendFmt(&pres_rels, a, "<Relationship Id=\"rId{d}\" Type=\"{s}\" Target=\"slides/slide{d}.xml\"/>", .{ i + 1, opc.RelType.slide, i + 1 });
         }
-        try pres.appendSlice(a, "</p:sldIdLst></p:presentation>");
-        try pres_rels.appendSlice(a, "</Relationships>");
+        try pres.appendSlice(a, "</p:sldIdLst><p:sldSz cx=\"9144000\" cy=\"6858000\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/></p:presentation>");
+        try appendFmt(&pres_rels, a, "<Relationship Id=\"rId{d}\" Type=\"{s}/slideMaster\" Target=\"slideMasters/slideMaster1.xml\"/></Relationships>", .{ master_rid, opc.rel_ns });
+
+        // Slide master (links the layout and the theme).
+        var master: std.ArrayList(u8) = .empty;
+        try appendFmt(&master, a, "{s}<p:sldMaster xmlns:p=\"{s}\" xmlns:a=\"{s}\" xmlns:r=\"{s}\">" ++
+            "<p:cSld><p:spTree>{s}</p:spTree></p:cSld>" ++
+            "<p:clrMap bg1=\"lt1\" tx1=\"dk1\" bg2=\"lt2\" tx2=\"dk2\" accent1=\"accent1\" accent2=\"accent2\" accent3=\"accent3\" accent4=\"accent4\" accent5=\"accent5\" accent6=\"accent6\" hlink=\"hlink\" folHlink=\"folHlink\"/>" ++
+            "<p:sldLayoutIdLst><p:sldLayoutId id=\"2147483649\" r:id=\"rId1\"/></p:sldLayoutIdLst>" ++
+            "</p:sldMaster>", .{ xml_decl, p_ns, a_ns, opc.rel_ns, sp_tree_header });
+        var master_rels: std.ArrayList(u8) = .empty;
+        try appendFmt(&master_rels, a, "{s}<Relationships xmlns=\"{s}\">" ++
+            "<Relationship Id=\"rId1\" Type=\"{s}/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\"/>" ++
+            "<Relationship Id=\"rId2\" Type=\"{s}/theme\" Target=\"../theme/theme1.xml\"/>" ++
+            "</Relationships>", .{ xml_decl, pkg_rels_xmlns, opc.rel_ns, opc.rel_ns });
+
+        // Slide layout (back-links the master).
+        var layout: std.ArrayList(u8) = .empty;
+        try appendFmt(&layout, a, "{s}<p:sldLayout xmlns:p=\"{s}\" xmlns:a=\"{s}\" xmlns:r=\"{s}\">" ++
+            "<p:cSld><p:spTree>{s}</p:spTree></p:cSld>" ++
+            "<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>" ++
+            "</p:sldLayout>", .{ xml_decl, p_ns, a_ns, opc.rel_ns, sp_tree_header });
+        var layout_rels: std.ArrayList(u8) = .empty;
+        try appendFmt(&layout_rels, a, "{s}<Relationships xmlns=\"{s}\">" ++
+            "<Relationship Id=\"rId1\" Type=\"{s}/slideMaster\" Target=\"../slideMasters/slideMaster1.xml\"/>" ++
+            "</Relationships>", .{ xml_decl, pkg_rels_xmlns, opc.rel_ns });
+
+        // Minimal valid theme: clrScheme + fontScheme + fmtScheme with the
+        // schema-required triples.
+        var theme: std.ArrayList(u8) = .empty;
+        try appendFmt(&theme, a, "{s}<a:theme xmlns:a=\"{s}\" name=\"nanoxml\"><a:themeElements>" ++
+            "<a:clrScheme name=\"nanoxml\">" ++
+            "<a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1>" ++
+            "<a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1>" ++
+            "<a:dk2><a:srgbClr val=\"44546A\"/></a:dk2>" ++
+            "<a:lt2><a:srgbClr val=\"E7E6E6\"/></a:lt2>" ++
+            "<a:accent1><a:srgbClr val=\"4472C4\"/></a:accent1>" ++
+            "<a:accent2><a:srgbClr val=\"ED7D31\"/></a:accent2>" ++
+            "<a:accent3><a:srgbClr val=\"A5A5A5\"/></a:accent3>" ++
+            "<a:accent4><a:srgbClr val=\"FFC000\"/></a:accent4>" ++
+            "<a:accent5><a:srgbClr val=\"5B9BD5\"/></a:accent5>" ++
+            "<a:accent6><a:srgbClr val=\"70AD47\"/></a:accent6>" ++
+            "<a:hlink><a:srgbClr val=\"0563C1\"/></a:hlink>" ++
+            "<a:folHlink><a:srgbClr val=\"954F72\"/></a:folHlink>" ++
+            "</a:clrScheme>" ++
+            "<a:fontScheme name=\"nanoxml\">" ++
+            "<a:majorFont><a:latin typeface=\"Calibri Light\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:majorFont>" ++
+            "<a:minorFont><a:latin typeface=\"Calibri\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:minorFont>" ++
+            "</a:fontScheme>" ++
+            "<a:fmtScheme name=\"nanoxml\">" ++
+            "<a:fillStyleLst><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:fillStyleLst>" ++
+            "<a:lnStyleLst><a:ln><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:ln></a:lnStyleLst>" ++
+            "<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>" ++
+            "<a:bgFillStyleLst><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:bgFillStyleLst>" ++
+            "</a:fmtScheme>" ++
+            "</a:themeElements></a:theme>", .{ xml_decl, a_ns });
 
         var root_rels: std.ArrayList(u8) = .empty;
         try appendFmt(&root_rels, a, "{s}<Relationships xmlns=\"{s}\">" ++
@@ -1172,6 +1257,11 @@ pub const PresentationBuilder = struct {
         try all.append(a, .{ .name = "_rels/.rels", .data = root_rels.items });
         try all.append(a, .{ .name = "ppt/presentation.xml", .data = pres.items });
         try all.append(a, .{ .name = "ppt/_rels/presentation.xml.rels", .data = pres_rels.items });
+        try all.append(a, .{ .name = "ppt/slideMasters/slideMaster1.xml", .data = master.items });
+        try all.append(a, .{ .name = "ppt/slideMasters/_rels/slideMaster1.xml.rels", .data = master_rels.items });
+        try all.append(a, .{ .name = "ppt/slideLayouts/slideLayout1.xml", .data = layout.items });
+        try all.append(a, .{ .name = "ppt/slideLayouts/_rels/slideLayout1.xml.rels", .data = layout_rels.items });
+        try all.append(a, .{ .name = "ppt/theme/theme1.xml", .data = theme.items });
         try all.appendSlice(a, files.items);
         return zipParts(gpa, all.items);
     }

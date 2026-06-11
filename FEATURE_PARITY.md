@@ -7,6 +7,32 @@ backed by tests — see [src/parity_test.zig](src/parity_test.zig) for the
 cross-cutting parity spec and each module's own test block for unit-level
 pins. 504 test executions across 9 suites.
 
+## 0. The 1:1 proof — refereed by Microsoft's own code
+
+[tools/interop_test.sh](tools/interop_test.sh) runs both libraries against
+each other using the real `DocumentFormat.OpenXml` 3.3.0 package (the
+published artifact of dotnet/Open-XML-SDK) on .NET 10:
+
+| Check | Result |
+|---|---|
+| SDK-created docx/xlsx/pptx → read by nanoxml (text, CSV with gaps+quoting, slides) | ✅ correct content |
+| SDK-created files → `nanoxml validate` | ✅ 0 errors |
+| nanoxml-created docx → Microsoft `OpenXmlValidator` | ✅ **0 errors** |
+| nanoxml-created xlsx → Microsoft `OpenXmlValidator` | ✅ **0 errors** |
+| nanoxml-created pptx → Microsoft `OpenXmlValidator` | ✅ **0 errors** (the SDK's own minimal `PresentationDocument.Create` output fails with 2 — nanoxml emits the full master/layout/theme/notesSz skeleton) |
+| SDK docx/xlsx → re-serialized through nanoxml's DOM (`nanoxml roundtrip`) → Microsoft validator | ✅ 0 errors |
+| SDK pptx → nanoxml round-trip | ✅ error count unchanged (2 pre-existing SDK errors in, 2 out — none added) |
+
+Head-to-head speed, identical workload (200k-row xlsx → shared-string-resolved,
+gap-preserving, quoted CSV; outputs character-identical), Apple Silicon,
+single thread:
+
+| Implementation | best | relative |
+|---|---|---|
+| **nanoxml** ReleaseFast | **179 ms** | 1× |
+| `DocumentFormat.OpenXml` 3.3.0 `OpenXmlReader` streaming, .NET 10 Release, post-JIT | 833 ms | **4.7× slower** |
+| Python stdlib | 2258 ms | 12.6× slower |
+
 ## 1. Package operations (`OpenXmlPackage`)
 
 | SDK | nanoxml | Status |

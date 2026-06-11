@@ -2,4 +2,6 @@
 zig-out/
 codedb.snapshot
 corpus/
+tools/interop/bin/
+tools/interop/obj/
 *.bak
