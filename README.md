@@ -10,7 +10,13 @@ Parity is **test-first and SDK-refereed**: [src/parity_test.zig](src/parity_test
 
 ## Install
 
-Prebuilt CLI binaries are on the [releases page](https://github.com/justrach/nanoxml/releases) (macOS binaries are Developer-ID signed):
+One-liner (detects platform, installs from the latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/justrach/nanoxml/main/install.sh | sh
+```
+
+Or grab a prebuilt binary from the [releases page](https://github.com/justrach/nanoxml/releases) (macOS binaries are Developer-ID signed):
 
 ```bash
 # macOS (Apple Silicon)
@@ -31,7 +37,7 @@ Verify downloads against [`checksums.sha256`](https://github.com/justrach/nanoxm
 As a Zig library (Zig 0.16):
 
 ```bash
-zig fetch --save https://github.com/justrach/nanoxml/archive/refs/tags/v0.0.1.tar.gz
+zig fetch --save https://github.com/justrach/nanoxml/archive/refs/tags/v0.0.2.tar.gz
 ```
 
 ```zig
@@ -46,6 +52,17 @@ Or build from source:
 git clone https://github.com/justrach/nanoxml && cd nanoxml
 zig build -Doptimize=ReleaseFast    # binary at zig-out/bin/nanoxml
 zig build test                      # full suite
+```
+
+## For agents
+
+nanoxml is built to be driven by AI agents: one static binary, `--json` output on the inspection commands, stdin/stdout piping, in-place or `--out` edits, strict exit codes, and a self-validation command to check work. **[AGENTS.md](AGENTS.md)** is the complete contract — paste-ready recipes for reading, editing (`set-cell`, `set-part`, `set-props`), creating (`from-csv`, `from-text`), and verifying (`validate --json`) Office files.
+
+```bash
+nanoxml info report.docx --json
+nanoxml set-cell budget.xlsx 0 B7 1250
+my-tool --csv | nanoxml from-csv - results.xlsx
+nanoxml validate results.xlsx --json   # {"ok":true,"errors":0,...}
 ```
 
 ## Layer map
