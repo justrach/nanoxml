@@ -1,0 +1,12 @@
+.{
+    .name = .nanoxml,
+    .fingerprint = 0xebf1b310efc410b,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
