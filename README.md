@@ -2,22 +2,27 @@
 
 Fast Office Open XML (`.docx` / `.xlsx` / `.pptx`) reading **and writing** for Zig 0.16. Zero dependencies.
 
-A from-scratch Zig take on [dotnet/Open-XML-SDK](https://github.com/dotnet/Open-XML-SDK): same layering, none of the weight. Open-XML-SDK ships ~6000 generated element classes; real workloads touch a dozen of them. nanoxml implements that hot dozen over a zero-copy SIMD pull parser, using the techniques from [justrach/codedb](https://github.com/justrach/codedb) (explicit `@Vector` scanning, arena-per-job allocation, slice-don't-copy).
+A from-scratch Zig take on [dotnet/Open-XML-SDK](https://github.com/dotnet/Open-XML-SDK): same layering, none of the weight. Open-XML-SDK ships ~6000 generated element classes; real workloads touch a dozen of them. nanoxml implements the full *feature surface* — packaging, parts/relationships, DOM, streaming read+write, validation, markup compatibility, Flat OPC — over a zero-copy SIMD pull parser, using the techniques from [justrach/codedb](https://github.com/justrach/codedb) (explicit `@Vector` scanning, arena-per-job allocation, slice-don't-copy).
 
-Parity is **test-first**: [src/parity_test.zig](src/parity_test.zig) was written before the
-write path existed and pins the Open-XML-SDK behaviors (create, round-trip,
-DOM editing, package properties). Created files are additionally validated by
-Info-ZIP (`unzip -t`) and Python's `zipfile`+`ElementTree`.
+**[FEATURE_PARITY.md](FEATURE_PARITY.md) maps every SDK feature area to the nanoxml API**, with the two deliberate exclusions documented.
+
+Parity is **test-first**: [src/parity_test.zig](src/parity_test.zig) pins the Open-XML-SDK behaviors (create, round-trip, DOM editing, Clone, Flat OPC, validation, MC processing, streaming writes, package properties). Created files are additionally validated by Info-ZIP (`unzip -t`) and Python's `zipfile`+`ElementTree`. 504 test executions across 9 suites.
 
 ## Layer map
 
 | Open-XML-SDK (.NET)                          | nanoxml (Zig)        |
 |----------------------------------------------|----------------------|
-| `System.IO.Packaging` ZIP container          | `src/zip.zig` (Archive + Writer) |
+| `System.IO.Packaging` ZIP container (+zip64 r/w) | `src/zip.zig` (Archive + Writer) |
 | `System.IO.Packaging` content types + rels   | `src/opc.zig` (open/getPart/setPart/save) |
-| `PackageProperties`                          | `opc.coreProperties` |
-| `OpenXmlReader` (streaming reader)           | `src/xml.zig`        |
-| `OpenXmlElement` tree (navigate/mutate)      | `src/dom.zig`        |
+| `OpenXmlPartContainer` (AddNewPart/DeletePart/AddExternalRelationship/AddHyperlinkRelationship) | `opc.Package.addPart/deletePart/add*Relationship` |
+| `PackageProperties` (read **and write**)     | `opc.coreProperties` / `opc.setCoreProperties` |
+| `CloneableExtensions.Clone`                  | `opc.Package.clone`  |
+| `FlatOpcExtensions` (To/FromFlatOpc)         | `src/flatopc.zig`    |
+| `OpenXmlReader` (streaming reader)           | `src/xml.zig` (`Parser`) |
+| `OpenXmlWriter` (streaming writer)           | `src/xml.zig` (`Writer`) |
+| `OpenXmlElement` tree (Descendants/Ancestors/Insert*/CloneNode/InnerXml/namespaces) | `src/dom.zig` |
+| `MarkupCompatibilityProcessSettings` (mc:AlternateContent/Ignorable/ProcessContent) | `src/mc.zig` |
+| `OpenXmlValidator`                           | `src/validate.zig`   |
 | `WordprocessingDocument` / `SpreadsheetDocument` / `PresentationDocument` (read) | `src/ooxml.zig` |
 | `*.Create()` (write)                         | `ooxml.DocumentBuilder` / `WorkbookBuilder` / `PresentationBuilder` |
 
@@ -80,6 +85,50 @@ try pkg.setPart("word/document.xml", ser.items);
 const new_file = try pkg.save(gpa); // untouched parts copied raw, no re-deflate
 ```
 
+Parts, relationships, properties, clone (the `OpenXmlPartContainer` surface):
+
+```zig
+// AddImagePart + FeedData + GetIdOfPart, in one call:
+const rid = (try pkg.addPart("word/media/image1.png", png_bytes, .{
+    .content_type = "image/png",
+    .rel_type = nanoxml.opc.RelType.image,
+    .rel_source = "word/document.xml",
+})).?;
+_ = try pkg.addHyperlinkRelationship("word/document.xml", "https://ziglang.org");
+try pkg.setCoreProperties(.{ .title = "Edited", .creator = "nanoxml" });
+try pkg.deletePart("word/media/old.png");   // part + CT + inbound rels
+var snapshot = try pkg.clone(gpa);          // independent in-memory copy
+```
+
+Validate, Flat OPC, markup compatibility:
+
+```zig
+var result = try nanoxml.validate.validatePackage(gpa, &pkg);
+defer result.deinit();
+for (result.diagnostics) |d| std.debug.print("[{s}] {s}: {s}\n", .{ @tagName(d.severity), d.part orelse "-", d.message });
+
+var flat: std.ArrayList(u8) = .empty;
+try nanoxml.flatopc.toFlatOpc(&pkg, gpa, &flat, .{ .progid = "Word.Document" });
+const zip_bytes = try nanoxml.flatopc.fromFlatOpc(gpa, flat.items);
+
+const w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+try nanoxml.mc.process(arena, root, .{ .understood = &.{w_ns} });
+```
+
+Streaming writes (`OpenXmlPartWriter`):
+
+```zig
+var out: std.ArrayList(u8) = .empty;
+var w = nanoxml.xml.Writer.init(gpa, &out);
+defer w.deinit();
+try w.writeDeclaration();
+try w.startElement("w:document");
+try w.attribute("xmlns:w", w_ns);
+try w.textElement("w:t", "a < b & c");   // escaped automatically
+try w.endElement();
+try w.end();                              // enforces balance
+```
+
 ## Numbers
 
 Apple Silicon, ReleaseFast, single thread. Corpus: synthetic 200k-row xlsx
@@ -107,13 +156,18 @@ Other corpora: 50k-paragraph docx → text in 16.7 ms (638 MiB/s); a real
   Measured cautionary tale: small allocations through `page_allocator` cost
   14× (one mmap syscall each).
 - **Cheap round-trips.** `Package.save` copies untouched entries in their
-  already-compressed form; only modified parts are re-deflated. The zip
-  writer falls back to store when deflate doesn't shrink an entry.
+  already-compressed form; only modified parts are re-deflated. Mutated
+  relationship lists and content types are re-serialized automatically
+  (sorted, deterministic). The zip writer falls back to store when deflate
+  doesn't shrink an entry, and emits zip64 records when limits are exceeded.
 - **Local-name matching** (`w:t`/`x:t`/`a:t` → `t`), and `r:id`-style
   attributes matched as "prefixed attr with local name `id`" — robust to
   producer prefix choices without namespace tables.
 
 ## What's covered
+
+See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the full SDK-to-nanoxml
+matrix. Headlines —
 
 Read: OPC (content types, rels, target resolution), zip64, store+deflate,
 docx text (tracked deletions and field codes excluded, `mc:AlternateContent`
@@ -123,17 +177,25 @@ pptx slide order + text, transitional/strict/macro-enabled detection, core
 properties.
 
 Write: document/workbook/presentation creation (typed cells, shared-string
-dedup, ordered slides, core properties), generic DOM editing, package
-round-trip via `setPart`/`save`, RFC-conformant escaping (inverse-of-decode,
-property-tested).
+dedup, ordered slides, core properties), generic DOM editing with the full
+`OpenXmlElement` mutation surface, part add/delete with relationship and
+content-type maintenance, external/hyperlink relationships, core-properties
+write-back, package clone, Flat OPC in both directions, streaming XML
+writer, zip64, RFC-conformant escaping (inverse-of-decode, property-tested).
 
-Not covered: schema validation, styles/themes/charts object model, encrypted
-packages, multi-threaded part parsing.
+Analysis: package validator (structure, well-formedness, relationship
+integrity, expected roots, `r:id` reference resolution), markup
+compatibility processor (AlternateContent/Ignorable/ProcessContent/
+MustUnderstand).
+
+Not covered (deliberately): the ~6000 generated typed classes (generic DOM
+instead), full ECMA-376 particle validation, encrypted packages (the SDK
+doesn't support those either).
 
 ## Tests & corpus
 
 ```bash
-zig build test       # 63 unique tests (192 executions), incl. the parity spec
+zig build test       # 504 test executions across 9 suites, incl. the parity spec
 python3 tools/gen_corpus.py xlsx corpus/big.xlsx 200000
 python3 tools/py_baseline.py corpus/big.xlsx 5
 ```

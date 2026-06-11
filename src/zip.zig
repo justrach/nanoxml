@@ -622,12 +622,14 @@ pub const CompressMethod = enum { store, deflate };
 /// Streaming zip composer. `addFile` deflates (falling back to store when
 /// deflate doesn't shrink the payload); `addRaw` copies an already-
 /// compressed entry verbatim — that's what makes package round-trips cheap.
-/// No zip64: entries and the directory must stay under 4 GiB / 65535 files,
-/// which holds for any real OOXML package this library writes.
+/// Entries, offsets, or counts that exceed the classic zip limits get
+/// zip64 records automatically (System.IO.Packaging parity); `force_zip64`
+/// emits them unconditionally so small archives can exercise the format.
 pub const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
     central: std.ArrayList(u8) = .empty,
     count: u64 = 0,
+    force_zip64: bool = false,
 
     pub fn deinit(self: *Writer, gpa: std.mem.Allocator) void {
         self.buf.deinit(gpa);
@@ -690,59 +692,172 @@ pub const Writer = struct {
         uncompressed_size: usize,
         payload: []const u8,
     ) WriteError!void {
-        if (uncompressed_size > 0xFFFF_FFFE or payload.len > 0xFFFF_FFFE or
-            name.len > 0xFFFF or self.buf.items.len > 0xFFFF_FFFE or
-            self.count >= 0xFFFF)
-            return WriteError.TooLarge;
-        const offset: u32 = @intCast(self.buf.items.len);
+        if (name.len > 0xFFFF) return WriteError.TooLarge;
+        const offset = self.buf.items.len;
+        const needs64 = self.force_zip64 or
+            uncompressed_size > 0xFFFF_FFFE or
+            payload.len > 0xFFFF_FFFE or
+            offset > 0xFFFF_FFFE;
+        const version: u16 = if (needs64) 45 else 20;
 
         var lh: [30]u8 = [_]u8{0} ** 30;
         std.mem.writeInt(u32, lh[0..4], local_sig, .little);
-        std.mem.writeInt(u16, lh[4..6], 20, .little); // version needed
+        std.mem.writeInt(u16, lh[4..6], version, .little);
         std.mem.writeInt(u16, lh[8..10], method, .little);
         std.mem.writeInt(u32, lh[14..18], crc, .little);
-        std.mem.writeInt(u32, lh[18..22], @intCast(payload.len), .little);
-        std.mem.writeInt(u32, lh[22..26], @intCast(uncompressed_size), .little);
+        if (needs64) {
+            // Sentinels redirect to the zip64 extra (both sizes, per spec).
+            std.mem.writeInt(u32, lh[18..22], 0xFFFF_FFFF, .little);
+            std.mem.writeInt(u32, lh[22..26], 0xFFFF_FFFF, .little);
+            std.mem.writeInt(u16, lh[28..30], 4 + 16, .little); // extra len
+        } else {
+            std.mem.writeInt(u32, lh[18..22], @intCast(payload.len), .little);
+            std.mem.writeInt(u32, lh[22..26], @intCast(uncompressed_size), .little);
+        }
         std.mem.writeInt(u16, lh[26..28], @intCast(name.len), .little);
         try self.buf.appendSlice(gpa, &lh);
         try self.buf.appendSlice(gpa, name);
+        if (needs64) {
+            var extra: [20]u8 = undefined;
+            std.mem.writeInt(u16, extra[0..2], 0x0001, .little);
+            std.mem.writeInt(u16, extra[2..4], 16, .little);
+            std.mem.writeInt(u64, extra[4..12], uncompressed_size, .little);
+            std.mem.writeInt(u64, extra[12..20], payload.len, .little);
+            try self.buf.appendSlice(gpa, &extra);
+        }
         try self.buf.appendSlice(gpa, payload);
 
         var ch: [46]u8 = [_]u8{0} ** 46;
         std.mem.writeInt(u32, ch[0..4], central_sig, .little);
-        std.mem.writeInt(u16, ch[4..6], 20, .little); // version made by
-        std.mem.writeInt(u16, ch[6..8], 20, .little); // version needed
+        std.mem.writeInt(u16, ch[4..6], version, .little); // version made by
+        std.mem.writeInt(u16, ch[6..8], version, .little); // version needed
         std.mem.writeInt(u16, ch[10..12], method, .little);
         std.mem.writeInt(u32, ch[16..20], crc, .little);
-        std.mem.writeInt(u32, ch[20..24], @intCast(payload.len), .little);
-        std.mem.writeInt(u32, ch[24..28], @intCast(uncompressed_size), .little);
+        if (needs64) {
+            std.mem.writeInt(u32, ch[20..24], 0xFFFF_FFFF, .little);
+            std.mem.writeInt(u32, ch[24..28], 0xFFFF_FFFF, .little);
+            std.mem.writeInt(u16, ch[30..32], 4 + 24, .little); // extra len
+            std.mem.writeInt(u32, ch[42..46], 0xFFFF_FFFF, .little);
+        } else {
+            std.mem.writeInt(u32, ch[20..24], @intCast(payload.len), .little);
+            std.mem.writeInt(u32, ch[24..28], @intCast(uncompressed_size), .little);
+            std.mem.writeInt(u32, ch[42..46], @intCast(offset), .little);
+        }
         std.mem.writeInt(u16, ch[28..30], @intCast(name.len), .little);
-        std.mem.writeInt(u32, ch[42..46], offset, .little);
         try self.central.appendSlice(gpa, &ch);
         try self.central.appendSlice(gpa, name);
+        if (needs64) {
+            // Spec order: uncompressed, compressed, local header offset.
+            var extra: [28]u8 = undefined;
+            std.mem.writeInt(u16, extra[0..2], 0x0001, .little);
+            std.mem.writeInt(u16, extra[2..4], 24, .little);
+            std.mem.writeInt(u64, extra[4..12], uncompressed_size, .little);
+            std.mem.writeInt(u64, extra[12..20], payload.len, .little);
+            std.mem.writeInt(u64, extra[20..28], offset, .little);
+            try self.central.appendSlice(gpa, &extra);
+        }
 
         self.count += 1;
     }
 
-    /// Append the central directory + EOCD and return the finished archive.
-    /// The Writer remains deinit-able but cannot accept further entries.
+    /// Append the central directory + EOCD (plus the zip64 EOCD record and
+    /// locator when needed) and return the finished archive. The Writer
+    /// remains deinit-able but cannot accept further entries.
     pub fn finish(self: *Writer, gpa: std.mem.Allocator) WriteError![]u8 {
         const cd_start = self.buf.items.len;
-        if (cd_start > 0xFFFF_FFFE) return WriteError.TooLarge;
         try self.buf.appendSlice(gpa, self.central.items);
         const cd_size = self.buf.items.len - cd_start;
 
+        const needs64 = self.force_zip64 or
+            self.count >= 0xFFFF or
+            cd_size > 0xFFFF_FFFE or
+            cd_start > 0xFFFF_FFFE;
+
+        if (needs64) {
+            const rec64_offset = self.buf.items.len;
+            var rec: [56]u8 = [_]u8{0} ** 56;
+            std.mem.writeInt(u32, rec[0..4], eocd64_sig, .little);
+            std.mem.writeInt(u64, rec[4..12], 44, .little); // size of remainder
+            std.mem.writeInt(u16, rec[12..14], 45, .little); // version made by
+            std.mem.writeInt(u16, rec[14..16], 45, .little); // version needed
+            std.mem.writeInt(u64, rec[24..32], self.count, .little); // entries (this disk)
+            std.mem.writeInt(u64, rec[32..40], self.count, .little); // entries (total)
+            std.mem.writeInt(u64, rec[40..48], cd_size, .little);
+            std.mem.writeInt(u64, rec[48..56], cd_start, .little);
+            try self.buf.appendSlice(gpa, &rec);
+
+            var loc: [20]u8 = [_]u8{0} ** 20;
+            std.mem.writeInt(u32, loc[0..4], eocd64_locator_sig, .little);
+            std.mem.writeInt(u64, loc[8..16], rec64_offset, .little);
+            std.mem.writeInt(u32, loc[16..20], 1, .little); // total disks
+            try self.buf.appendSlice(gpa, &loc);
+        }
+
         var eocd: [22]u8 = [_]u8{0} ** 22;
         std.mem.writeInt(u32, eocd[0..4], eocd_sig, .little);
-        std.mem.writeInt(u16, eocd[8..10], @intCast(self.count), .little);
-        std.mem.writeInt(u16, eocd[10..12], @intCast(self.count), .little);
-        std.mem.writeInt(u32, eocd[12..16], @intCast(cd_size), .little);
-        std.mem.writeInt(u32, eocd[16..20], @intCast(cd_start), .little);
+        if (needs64) {
+            std.mem.writeInt(u16, eocd[8..10], 0xFFFF, .little);
+            std.mem.writeInt(u16, eocd[10..12], 0xFFFF, .little);
+            std.mem.writeInt(u32, eocd[12..16], 0xFFFF_FFFF, .little);
+            std.mem.writeInt(u32, eocd[16..20], 0xFFFF_FFFF, .little);
+        } else {
+            std.mem.writeInt(u16, eocd[8..10], @intCast(self.count), .little);
+            std.mem.writeInt(u16, eocd[10..12], @intCast(self.count), .little);
+            std.mem.writeInt(u32, eocd[12..16], @intCast(cd_size), .little);
+            std.mem.writeInt(u32, eocd[16..20], @intCast(cd_start), .little);
+        }
         try self.buf.appendSlice(gpa, &eocd);
 
         return self.buf.toOwnedSlice(gpa);
     }
 };
+
+test "writer: forced zip64 archives round-trip through our reader" {
+    const gpa = testing.allocator;
+    var w = Writer{ .force_zip64 = true };
+    defer w.deinit(gpa);
+
+    const body = "zip64 payload that should deflate " ** 8;
+    try w.addFile(gpa, "big/data.xml", body, .deflate);
+    try w.addFile(gpa, "raw.bin", "\x00\x01\x02\x03", .store);
+    const bytes = try w.finish(gpa);
+    defer gpa.free(bytes);
+
+    // Sentinels present in the EOCD, real values in the zip64 record.
+    var ar = try Archive.open(gpa, bytes);
+    defer ar.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), ar.entries.len);
+
+    const e = ar.find("big/data.xml").?;
+    try testing.expectEqual(@as(u64, body.len), e.uncompressed_size);
+    const out = try ar.extractAlloc(gpa, e, .{});
+    defer gpa.free(out);
+    try testing.expectEqualStrings(body, out);
+
+    const raw = try ar.extractAlloc(gpa, ar.find("raw.bin").?, .{});
+    defer gpa.free(raw);
+    try testing.expectEqualSlices(u8, "\x00\x01\x02\x03", raw);
+}
+
+test "writer: entry count past the u16 limit flips to zip64 automatically" {
+    const gpa = testing.allocator;
+    var w = Writer{};
+    defer w.deinit(gpa);
+
+    var name_buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 0x10003) : (i += 1) {
+        const name = std.fmt.bufPrint(&name_buf, "e{x:0>5}", .{i}) catch unreachable;
+        try w.addFile(gpa, name, "", .store);
+    }
+    const bytes = try w.finish(gpa);
+    defer gpa.free(bytes);
+
+    var ar = try Archive.open(gpa, bytes);
+    defer ar.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0x10003), ar.entries.len);
+    try testing.expect(ar.find("e10002") != null);
+}
 
 test "writer: empty archive is a valid zip" {
     const gpa = testing.allocator;

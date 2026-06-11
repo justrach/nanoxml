@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
         "src/xml.zig",
         "src/dom.zig",
         "src/opc.zig",
+        "src/mc.zig",
+        "src/flatopc.zig",
+        "src/validate.zig",
         "src/ooxml.zig",
         "src/parity_test.zig",
     };

@@ -682,3 +682,175 @@ pub fn escapeAppend(
     }
     try out.appendSlice(gpa, raw[start..]);
 }
+
+// ── Streaming writer (the `OpenXmlWriter` layer) ────────────────────────────
+
+pub const WriterError = error{ OutOfMemory, InvalidState, Unbalanced };
+
+/// Forward-only XML writer mirroring OpenXmlPartWriter:
+/// `WriteStartDocument` → writeDeclaration, `WriteStartElement` →
+/// startElement, `WriteString` → text, `WriteEndElement` → endElement.
+/// Escaping is automatic; `end()` enforces balance. Elements with no
+/// content collapse to self-closing tags.
+pub const Writer = struct {
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    /// Names of currently open elements (duped; freed on pop).
+    stack: std.ArrayList([]u8) = .empty,
+    in_start_tag: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator, out: *std.ArrayList(u8)) Writer {
+        return .{ .gpa = gpa, .out = out };
+    }
+
+    pub fn deinit(self: *Writer) void {
+        for (self.stack.items) |n| self.gpa.free(n);
+        self.stack.deinit(self.gpa);
+    }
+
+    /// SDK `WriteStartDocument()`.
+    pub fn writeDeclaration(self: *Writer) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.gpa, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+    }
+
+    fn closePendingStartTag(self: *Writer) error{OutOfMemory}!void {
+        if (self.in_start_tag) {
+            try self.out.append(self.gpa, '>');
+            self.in_start_tag = false;
+        }
+    }
+
+    /// SDK `WriteStartElement`. `name` is the qualified name ("w:p").
+    pub fn startElement(self: *Writer, name: []const u8) error{OutOfMemory}!void {
+        try self.closePendingStartTag();
+        try self.out.append(self.gpa, '<');
+        try self.out.appendSlice(self.gpa, name);
+        try self.stack.append(self.gpa, try self.gpa.dupe(u8, name));
+        self.in_start_tag = true;
+    }
+
+    /// Write an attribute on the element just started. InvalidState once
+    /// any content (text, raw, or a child element) has been written.
+    pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
+        if (!self.in_start_tag) return WriterError.InvalidState;
+        try self.out.append(self.gpa, ' ');
+        try self.out.appendSlice(self.gpa, name);
+        try self.out.appendSlice(self.gpa, "=\"");
+        try escapeAppend(self.out, self.gpa, value, .attr);
+        try self.out.append(self.gpa, '"');
+    }
+
+    /// SDK `WriteString`: escaped character data.
+    pub fn text(self: *Writer, s: []const u8) error{OutOfMemory}!void {
+        try self.closePendingStartTag();
+        try escapeAppend(self.out, self.gpa, s, .text);
+    }
+
+    /// Pre-built markup, appended verbatim (SDK `WriteRaw`).
+    pub fn raw(self: *Writer, s: []const u8) error{OutOfMemory}!void {
+        try self.closePendingStartTag();
+        try self.out.appendSlice(self.gpa, s);
+    }
+
+    /// SDK `WriteEndElement`. An element closed before any content was
+    /// written becomes self-closing.
+    pub fn endElement(self: *Writer) WriterError!void {
+        if (self.stack.items.len == 0) return WriterError.Unbalanced;
+        const name = self.stack.pop().?;
+        defer self.gpa.free(name);
+        if (self.in_start_tag) {
+            try self.out.appendSlice(self.gpa, "/>");
+            self.in_start_tag = false;
+        } else {
+            try self.out.appendSlice(self.gpa, "</");
+            try self.out.appendSlice(self.gpa, name);
+            try self.out.append(self.gpa, '>');
+        }
+    }
+
+    /// `startElement` + `text` + `endElement` (SDK `WriteElement` on a leaf).
+    pub fn textElement(self: *Writer, name: []const u8, s: []const u8) WriterError!void {
+        try self.startElement(name);
+        if (s.len > 0) try self.text(s);
+        try self.endElement();
+    }
+
+    /// Close the writer; Unbalanced if any element is still open.
+    pub fn end(self: *Writer) WriterError!void {
+        if (self.stack.items.len != 0) return WriterError.Unbalanced;
+    }
+};
+
+test "writer: nested elements, attributes, escaping, self-closing" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    var w = Writer.init(testing.allocator, &out);
+    defer w.deinit();
+
+    try w.writeDeclaration();
+    try w.startElement("w:document");
+    try w.attribute("xmlns:w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main");
+    try w.startElement("w:body");
+    try w.startElement("w:p");
+    try w.startElement("w:r");
+    try w.textElement("w:t", "a < b & \"c\"");
+    try w.endElement(); // r
+    try w.endElement(); // p
+    try w.startElement("w:sectPr");
+    try w.endElement(); // sectPr — no content, self-closes
+    try w.endElement(); // body
+    try w.endElement(); // document
+    try w.end();
+
+    try testing.expectEqualStrings(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">" ++
+            "<w:body><w:p><w:r><w:t>a &lt; b &amp; \"c\"</w:t></w:r></w:p><w:sectPr/></w:body></w:document>",
+        out.items,
+    );
+}
+
+test "writer output reparses to identical events" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var w = Writer.init(testing.allocator, &out);
+    defer w.deinit();
+
+    try w.startElement("root");
+    try w.attribute("k", "v<>&'\"");
+    try w.text("body ]]> text");
+    try w.endElement();
+    try w.end();
+
+    var p = Parser.init(out.items);
+    const st = (try p.next()).start;
+    try testing.expectEqualStrings("root", st.name);
+    var it = st.attrs();
+    var val: std.ArrayList(u8) = .empty;
+    defer val.deinit(testing.allocator);
+    try decodeAppend(&val, testing.allocator, it.next().?.value);
+    try testing.expectEqualStrings("v<>&'\"", val.items);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try decodeAppend(&body, testing.allocator, (try p.next()).text);
+    try testing.expectEqualStrings("body ]]> text", body.items);
+    try testing.expect((try p.next()) == .end);
+}
+
+test "writer: state errors" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var w = Writer.init(testing.allocator, &out);
+    defer w.deinit();
+
+    try testing.expectError(WriterError.Unbalanced, w.endElement());
+
+    try w.startElement("a");
+    try w.text("x");
+    try testing.expectError(WriterError.InvalidState, w.attribute("k", "v"));
+    try testing.expectError(WriterError.Unbalanced, w.end());
+    try w.endElement();
+    try w.end();
+}

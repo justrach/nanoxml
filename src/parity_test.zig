@@ -375,3 +375,282 @@ test "parity: builders stamp core properties" {
     try testing.expectEqualStrings("Built by tests", props.title.?);
     try testing.expectEqualStrings("nanoxml", props.creator.?);
 }
+
+// ── 11. CloneableExtensions.Clone ──────────────────────────────────────────
+
+const mc = @import("mc.zig");
+const flatopc = @import("flatopc.zig");
+const validate = @import("validate.zig");
+
+test "parity: Clone yields an independent, saveable package" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.DocumentBuilder.init(gpa);
+    defer b.deinit();
+    try b.addParagraph("clone me");
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+    var copy = try pkg.clone(gpa);
+    defer copy.deinit();
+
+    // Mutate the original; clone is unaffected (SDK Clone semantics).
+    try pkg.setPart("word/document.xml", "<w:document><w:body/></w:document>");
+    var doc = try ooxml.WordDocument.open(&copy);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try doc.text(gpa, &out);
+    try testing.expectEqualStrings("clone me\n", out.items);
+}
+
+// ── 12. AddNewPart / DeletePart / reference relationships ─────────────────
+
+test "parity: add an image part with relationship, then delete it" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.DocumentBuilder.init(gpa);
+    defer b.deinit();
+    try b.addParagraph("doc with image");
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+
+    // SDK: mainPart.AddImagePart(ImagePartType.Png) + FeedData + GetIdOfPart.
+    const rid = (try pkg.addPart("word/media/image1.png", "\x89PNG-bytes", .{
+        .content_type = "image/png",
+        .rel_type = opc.RelType.image,
+        .rel_source = "word/document.xml",
+    })).?;
+    // SDK: mainPart.AddHyperlinkRelationship(uri, true).
+    _ = try pkg.addHyperlinkRelationship("word/document.xml", "https://ziglang.org");
+
+    const saved = try pkg.save(gpa);
+    defer gpa.free(saved);
+    var pkg2 = try opc.Package.open(gpa, saved);
+    defer pkg2.deinit();
+
+    const img_part = (try pkg2.partByRelId("word/document.xml", rid)).?;
+    try testing.expectEqualStrings("word/media/image1.png", img_part);
+    try testing.expectEqualStrings("\x89PNG-bytes", try pkg2.getPart(img_part));
+
+    // SDK: DeletePart removes content + relationship.
+    try pkg2.deletePart("word/media/image1.png");
+    const resaved = try pkg2.save(gpa);
+    defer gpa.free(resaved);
+    var pkg3 = try opc.Package.open(gpa, resaved);
+    defer pkg3.deinit();
+    try testing.expect(!pkg3.hasPart("word/media/image1.png"));
+    try testing.expect((try pkg3.partByRelId("word/document.xml", rid)) == null);
+}
+
+// ── 13. FlatOpcExtensions ──────────────────────────────────────────────────
+
+test "parity: ToFlatOpcString/FromFlatOpc round-trips a builder document" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.WorkbookBuilder.init(gpa);
+    defer b.deinit();
+    const sheet = try b.addSheet("Data");
+    try b.setCell(sheet, 0, 0, .{ .string = "flat" });
+    try b.setCell(sheet, 0, 1, .{ .number = 42 });
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(gpa);
+    try flatopc.toFlatOpc(&pkg, gpa, &flat, .{ .progid = "Excel.Sheet" });
+
+    const rebuilt = try flatopc.fromFlatOpc(gpa, flat.items);
+    defer gpa.free(rebuilt);
+    var pkg2 = try opc.Package.open(gpa, rebuilt);
+    defer pkg2.deinit();
+
+    var wb = try ooxml.Workbook.open(&pkg2);
+    var csv: std.ArrayList(u8) = .empty;
+    defer csv.deinit(gpa);
+    try wb.sheetToCsv(gpa, 0, &csv);
+    try testing.expectEqualStrings("flat,42\n", csv.items);
+}
+
+// ── 14. OpenXmlValidator ───────────────────────────────────────────────────
+
+test "parity: validator passes builder output and flags corruption" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.PresentationBuilder.init(gpa);
+    defer b.deinit();
+    try b.addSlide(&.{"only slide"});
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+    var clean = try validate.validatePackage(gpa, &pkg);
+    defer clean.deinit();
+    try testing.expect(clean.ok());
+
+    // Corrupt a part the way OpenXmlValidator would object to.
+    try pkg.setPart("ppt/slides/slide1.xml", "<p:sld><unclosed></p:sld>");
+    var dirty = try validate.validatePackage(gpa, &pkg);
+    defer dirty.deinit();
+    try testing.expect(!dirty.ok());
+    try testing.expect(dirty.errorCount() >= 1);
+}
+
+// ── 15. MarkupCompatibility processing ─────────────────────────────────────
+
+test "parity: MCSettings-style AlternateContent resolution over a real part" {
+    const gpa = testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    const part =
+        "<w:document xmlns:w=\"" ++ w_ns ++ "\" " ++
+        "xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" " ++
+        "xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" mc:Ignorable=\"w14\">" ++
+        "<w:body><w:p w14:paraId=\"1A2B\"><w:r><w:t>kept</w:t></w:r></w:p></w:body></w:document>";
+
+    const root = try dom.parse(arena, part);
+    try mc.process(arena, root, .{ .understood = &.{w_ns} });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try dom.serialize(root, gpa, &out, .{ .declaration = false });
+    try testing.expect(std.mem.indexOf(u8, out.items, "w14:paraId") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "kept") != null);
+}
+
+// ── 16. PackageProperties setter ───────────────────────────────────────────
+
+test "parity: PackageProperties are writable on an opened package" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.DocumentBuilder.init(gpa);
+    defer b.deinit();
+    b.title = "before";
+    try b.addParagraph("body");
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+    try pkg.setCoreProperties(.{ .title = "after", .creator = "fable" });
+
+    const saved = try pkg.save(gpa);
+    defer gpa.free(saved);
+    var pkg2 = try opc.Package.open(gpa, saved);
+    defer pkg2.deinit();
+    const props = try pkg2.coreProperties();
+    try testing.expectEqualStrings("after", props.title.?);
+    try testing.expectEqualStrings("fable", props.creator.?);
+}
+
+// ── 17. OpenXmlElement traversal/mutation surface ──────────────────────────
+
+test "parity: Descendants/CloneNode/InsertAfter compose on a real document" {
+    const gpa = testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var b = ooxml.DocumentBuilder.init(gpa);
+    defer b.deinit();
+    try b.addParagraph("one");
+    try b.addParagraph("two");
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+    const root = try dom.parse(arena, try pkg.getPart("word/document.xml"));
+
+    // SDK: body.Descendants<Paragraph>().Count() == 2
+    var paras: std.ArrayList(*dom.Element) = .empty;
+    defer paras.deinit(gpa);
+    var it = root.descendants(gpa, "p");
+    defer it.deinit();
+    while (try it.next()) |p| try paras.append(gpa, p);
+    try testing.expectEqual(@as(usize, 2), paras.items.len);
+
+    // SDK: var copy = (Paragraph)p.CloneNode(true); body.InsertAfter(copy, p);
+    const second = paras.items[1];
+    const copy = try second.cloneNode(arena, true);
+    try copy.child("r").?.child("t").?.setText(arena, "three");
+    try second.parent.?.insertAfter(arena, copy, second);
+
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(gpa);
+    try dom.serialize(root, gpa, &ser, .{});
+    try pkg.setPart("word/document.xml", ser.items);
+
+    const saved = try pkg.save(gpa);
+    defer gpa.free(saved);
+    var pkg2 = try opc.Package.open(gpa, saved);
+    defer pkg2.deinit();
+    var doc = try ooxml.WordDocument.open(&pkg2);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try doc.text(gpa, &out);
+    try testing.expectEqualStrings("one\ntwo\nthree\n", out.items);
+}
+
+// ── 18. OpenXmlPartWriter streaming write ──────────────────────────────────
+
+test "parity: stream-write a worksheet part with OpenXmlWriter semantics" {
+    const gpa = testing.allocator;
+
+    var b = ooxml.WorkbookBuilder.init(gpa);
+    defer b.deinit();
+    const s = try b.addSheet("S");
+    try b.setCell(s, 0, 0, .{ .string = "placeholder" });
+    const bytes = try b.save(gpa);
+    defer gpa.free(bytes);
+
+    var pkg = try opc.Package.open(gpa, bytes);
+    defer pkg.deinit();
+
+    // SDK OpenXmlPartWriter: WriteStartDocument, WriteStartElement(...),
+    // attributes, WriteString, WriteEndElement, Close.
+    var part: std.ArrayList(u8) = .empty;
+    defer part.deinit(gpa);
+    var w = xml.Writer.init(gpa, &part);
+    defer w.deinit();
+    try w.writeDeclaration();
+    try w.startElement("worksheet");
+    try w.attribute("xmlns", "http://schemas.openxmlformats.org/spreadsheetml/2006/main");
+    try w.startElement("sheetData");
+    try w.startElement("row");
+    try w.attribute("r", "1");
+    try w.startElement("c");
+    try w.attribute("r", "A1");
+    try w.attribute("t", "inlineStr");
+    try w.startElement("is");
+    try w.textElement("t", "streamed");
+    try w.endElement(); // is
+    try w.endElement(); // c
+    try w.endElement(); // row
+    try w.endElement(); // sheetData
+    try w.endElement(); // worksheet
+    try w.end();
+
+    try pkg.setPart("xl/worksheets/sheet1.xml", part.items);
+    const saved = try pkg.save(gpa);
+    defer gpa.free(saved);
+
+    var pkg2 = try opc.Package.open(gpa, saved);
+    defer pkg2.deinit();
+    var wb = try ooxml.Workbook.open(&pkg2);
+    var csv: std.ArrayList(u8) = .empty;
+    defer csv.deinit(gpa);
+    try wb.sheetToCsv(gpa, 0, &csv);
+    try testing.expectEqualStrings("streamed\n", csv.items);
+}
