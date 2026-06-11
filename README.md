@@ -8,6 +8,46 @@ A from-scratch Zig take on [dotnet/Open-XML-SDK](https://github.com/dotnet/Open-
 
 Parity is **test-first and SDK-refereed**: [src/parity_test.zig](src/parity_test.zig) pins the Open-XML-SDK behaviors (create, round-trip, DOM editing, Clone, Flat OPC, validation, MC processing, streaming writes, package properties), and [tools/interop_test.sh](tools/interop_test.sh) cross-validates against the **real** `DocumentFormat.OpenXml` package in both directions — files the SDK creates are read by nanoxml, files nanoxml creates pass Microsoft's own `OpenXmlValidator` with **zero errors** (docx, xlsx, and pptx — the pptx skeleton nanoxml emits is stricter than the SDK's own minimal `Create()` output, which fails its own validator). 504+ test executions across 9 suites.
 
+## Install
+
+Prebuilt CLI binaries are on the [releases page](https://github.com/justrach/nanoxml/releases) (macOS binaries are Developer-ID signed):
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL -o nanoxml https://github.com/justrach/nanoxml/releases/latest/download/nanoxml-darwin-arm64
+# macOS (Intel)
+curl -fsSL -o nanoxml https://github.com/justrach/nanoxml/releases/latest/download/nanoxml-darwin-x86_64
+# Linux (x86_64)
+curl -fsSL -o nanoxml https://github.com/justrach/nanoxml/releases/latest/download/nanoxml-linux-x86_64
+# Linux (arm64)
+curl -fsSL -o nanoxml https://github.com/justrach/nanoxml/releases/latest/download/nanoxml-linux-arm64
+
+chmod +x nanoxml && sudo mv nanoxml /usr/local/bin/
+nanoxml            # prints usage
+```
+
+Verify downloads against [`checksums.sha256`](https://github.com/justrach/nanoxml/releases/latest/download/checksums.sha256).
+
+As a Zig library (Zig 0.16):
+
+```bash
+zig fetch --save https://github.com/justrach/nanoxml/archive/refs/tags/v0.0.1.tar.gz
+```
+
+```zig
+// build.zig
+const nanoxml = b.dependency("nanoxml", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("nanoxml", nanoxml.module("nanoxml"));
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/justrach/nanoxml && cd nanoxml
+zig build -Doptimize=ReleaseFast    # binary at zig-out/bin/nanoxml
+zig build test                      # full suite
+```
+
 ## Layer map
 
 | Open-XML-SDK (.NET)                          | nanoxml (Zig)        |
